@@ -82,13 +82,23 @@ async function preflight() {
   return gpu;
 }
 
+/**
+ * Fully tear down the gateway including Docker volumes that can cause
+ * "Corrupted cluster state" on subsequent runs.
+ */
+function destroyGateway() {
+  run("openshell gateway destroy -g nemoclaw 2>/dev/null || true", { ignoreError: true });
+  // Remove leftover Docker volumes that openshell gateway destroy may miss
+  run('docker volume ls -q --filter "name=openshell-cluster-nemoclaw" | xargs -r docker volume rm 2>/dev/null || true', { ignoreError: true });
+}
+
 // ── Step 2: Gateway ──────────────────────────────────────────────
 
 async function startGateway(gpu) {
   step(2, 7, "Starting OpenShell gateway");
 
-  // Destroy old gateway
-  run("openshell gateway destroy -g nemoclaw 2>/dev/null || true", { ignoreError: true });
+  // Destroy old gateway and clean up any leftover Docker state from previous failures
+  destroyGateway();
 
   const gwArgs = ["--name", "nemoclaw"];
   // Do NOT pass --gpu here. On DGX Spark (and most GPU hosts), inference is
@@ -97,7 +107,14 @@ async function startGateway(gpu) {
   // FailedPrecondition errors when the gateway's k3s device plugin cannot
   // allocate GPUs. See: https://build.nvidia.com/spark/nemoclaw/instructions
 
-  run(`openshell gateway start ${gwArgs.join(" ")}`, { ignoreError: false });
+  const startResult = run(`openshell gateway start ${gwArgs.join(" ")}`, { ignoreError: true });
+  if (startResult.status !== 0) {
+    console.error("  Gateway failed to start. Cleaning up stale state...");
+    destroyGateway();
+    console.error("  Stale state removed. Please rerun the installer.");
+    console.error("  If the error persists, run: openshell gateway info");
+    process.exit(1);
+  }
 
   // Verify health
   for (let i = 0; i < 5; i++) {
@@ -107,7 +124,9 @@ async function startGateway(gpu) {
       break;
     }
     if (i === 4) {
-      console.error("  Gateway failed to start. Run: openshell gateway info");
+      console.error("  Gateway health check failed. Cleaning up...");
+      destroyGateway();
+      console.error("  Run the installer again. If the error persists: openshell gateway info");
       process.exit(1);
     }
     require("child_process").spawnSync("sleep", ["2"]);
